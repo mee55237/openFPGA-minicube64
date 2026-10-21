@@ -1,0 +1,41 @@
+{
+	"partitions" : [
+		{
+			"name" : "Top",
+			"pins" : [
+				{
+					"name" : "scal_auddac",
+					"strict" : false
+				},
+				{
+					"name" : "scal_audlrck",
+					"strict" : false
+				},
+				{
+					"name" : "bridge_spimosi",
+					"strict" : false
+				},
+				{
+					"name" : "bridge_spimiso",
+					"strict" : false
+				},
+				{
+					"name" : "bridge_spiclk",
+					"strict" : false
+				},
+				{
+					"name" : "bridge_1wire",
+					"strict" : false
+				},
+				{
+					"name" : "clk_74a",
+					"strict" : false
+				},
+				{
+					"name" : "bridge_spiss",
+					"strict" : false
+				}
+			]
+		}
+	]
+}

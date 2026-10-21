@@ -1,0 +1,26 @@
+# -------------------------------------------------------------------------- #
+#
+# Quartus Prime
+# Version 18.1.1 Build 646 04/11/2019 SJ Lite Edition
+# Date created = 21:31:36  January 22, 2020
+#
+# -------------------------------------------------------------------------- #
+# Minicube64 -- Analogue Pocket core.
+#
+# Taken from C:/Code/Wasm4/VexiiRiscv/ap_core.qpf. The project and revision stay
+# named "ap_core" so this file, ap_core.qsf and the revision folder all agree;
+# the Pocket build/packaging flow expects that name.
+#
+# Quartus writes QUARTUS_VERSION when it saves this file. It says 18.1 because
+# that is what the version-controlled IP in rtl/ (mf_datatable, mf_ddio_bidir_12,
+# IP_TOOL_VERSION "18.1") was generated with. Opening the project in a newer
+# Quartus is fine -- it will offer to upgrade those IP files, and that upgrade is
+# the moment to check the fit still passes, not something to do blind.
+# -------------------------------------------------------------------------- #
+
+QUARTUS_VERSION = "18.1"
+DATE = "21:31:36  January 22, 2020"
+
+# Revisions
+
+PROJECT_REVISION = "ap_core"
