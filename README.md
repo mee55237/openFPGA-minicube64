@@ -1,7 +1,7 @@
 # openFPGA-minicube64
 Minicube64 for the Analogue Pocket
 
-Minicube64 is a fantasy console based on 6502, with the intention of helping people learn how games were made for older systems such as Atari 26OO, NES or C64, but without many of the difficult hardware restrictions.
+Minicube64 is a fantasy console based on 6502, with the intention of helping people learn how games were made for older systems such as Atari 2600, NES or C64, but without many of the difficult hardware restrictions.
 
 It runs 6.4mhz, with 64kb of ram and a simple 64x64 pixel framebuffer with 64 colors.
 
