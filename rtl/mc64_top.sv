@@ -516,8 +516,13 @@ module mc64_top (
     assign dbg_y       = cpu_dbg_y;
     assign dbg_s       = cpu_dbg_s;
     assign dbg_status  = cpu_P;
+    /* The address still names the framebuffer slot this pixel is at -- the same
+     * one the store was filled from -- but the BYTE has to be the one the colour
+     * lookup consumed, which after the first capture is the store's and not the
+     * one on the RAM bus (rtl/mc64_video.sv's THE FRAME STORE). tb_mc64 records
+     * both for compare.py's picture check. */
     assign dbg_vid_addr  = vid_ram_addr;
-    assign dbg_vid_rdata = ram_rdata_b;
+    assign dbg_vid_rdata = video_pic_byte;
     // the video's latched banks are real nets now (the state engine's deferred
     // window reads them); the harness keeps its own names for them
     assign dbg_vram_bank_q = video_cur_vram_bank;
@@ -719,6 +724,7 @@ module mc64_top (
     wire [31:0] ram_rdata_a_word;   // ... the same read, whole, for the engine
     wire [ 7:0] ram_rdata_b;
     wire [15:0] vid_ram_addr;
+    wire [ 7:0] video_pic_byte;
 
     // The DMC's sample fetch borrows one port-B cycle from the video. Both
     // signals are driven in the APU section below, where the fetch lives and
@@ -1089,6 +1095,11 @@ module mc64_top (
         .ram_rdata      (ram_rdata_b),
         .vram_bank      (vram_bank),
         .pal_bank       (pal_bank),
+        /* The DMC's sample fetch takes port B for one cycle at a time; the
+         * video's frame store re-issues a read that lands on one (see its port
+         * note), so it needs to know. */
+        .dmc_take       (dmc_take),
+        .pic_byte       (video_pic_byte),
         .video_rgb      (video_rgb),
         .video_de       (video_de),
         .video_hs       (video_hs),

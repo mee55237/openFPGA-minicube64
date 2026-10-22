@@ -106,14 +106,17 @@
  * Hz with ~5-clock (0.0045%) jitter rather than the 0.13% systematic error that
  * made the panel drop a frame every 13 s.
  *
- * AND THE HONEST LIMIT: a cartridge that draws into the framebuffer in the last
- * quarter of its frame -- after the window opens -- is still sampled live, so it
- * can still be caught mid-redraw. What is fixed is the case that matters, the
- * vblank-driven redraw, and the direction of the error: the picture now shows a
- * frame that is complete as of the end of the CPU frame before it, rather than
- * one that raced the drawing that produced it. Closing that last gap means
- * buffering the frame (a 4 KB shadow and a copy engine), which is a much larger
- * change than a phase, and it is not what the panel's d-pad bug needed.
+ * THE PHASE LOCK IS NOT THE WHOLE ANSWER, AND THE REST IS THE FRAME STORE.
+ * Locking the phase fixed the cartridge that redraws on vblank and finishes
+ * early; it cannot fix one that is still drawing while the beam is over the
+ * picture. That is not hypothetical: the panel's `Dead End Holiday Demo` redraws
+ * its `FIND PRESENTS` banner top-down and reaches it about 9,400 clocks after
+ * the picture starts, so the beam read the last two rows of the bar before the
+ * cartridge had written them and the picture showed the room instead. THE FRAME
+ * STORE below is the answer -- the picture is drawn from a 4 KB copy taken in
+ * the blanking, so it is always a frame the cartridge had FINISHED, at the cost
+ * of at most one raster frame of latency -- zero for a cartridge that has
+ * finished drawing before the capture. See that note for the whole of it.
  *
  * {frame_end} below is the raster's own rollover, kept for the testbench.
  *
@@ -333,6 +336,17 @@ module mc64_video #(
     input  logic [ 7:0] vram_bank,  // $0100
     input  logic [ 7:0] pal_bank,   // $0101
 
+    /* ---- the DMC is borrowing port B THIS CYCLE ---------------------------
+     *
+     * mc64_top's port-B mux gives the sample fetch priority over the video, so
+     * on such a cycle `ram_rdata` is the DMC's byte and not the one this module
+     * asked for. The scan-out used to take it anyway (one stray pixel, which is
+     * the old behaviour and is not made worse here -- the picture no longer
+     * reads port B at all once the store is full), and the frame store's copy
+     * RE-ISSUES the read instead, so a capture can never take a sample byte for
+     * a framebuffer byte. */
+    input  logic        dmc_take,
+
     // ---- APF video ----
     output logic [23:0] video_rgb,
     output logic        video_de,
@@ -358,6 +372,18 @@ module mc64_video #(
      * sim harness takes them from mc64_top's own nets rather than from here. */
     output logic [ 7:0] cur_vram_bank,
     output logic [ 7:0] cur_pal_bank,
+
+    /* ---- the byte each pixel was DRAWN from, and the address it lives at ---
+     *
+     * In the pixel cycle the colour is shifted out, these say what produced it:
+     * the store's byte (once the store is full) or port B's (before that), and
+     * the VRAM address that byte was taken from -- `vram_bank*4096 + i` either
+     * way, because the store is filled from exactly those addresses. tb_mc64
+     * records them for compare.py's picture check, which is why they exist: the
+     * pin's colour has to be checkable against the byte it came from, and that
+     * byte is no longer the one on the RAM bus (see THE FRAME STORE below).
+     * Nothing in the core reads them. */
+    output logic [ 7:0] pic_byte,
 
     /* ---- the raster's vertical blanking, as a slot a state write fits in ---
      *
@@ -516,6 +542,102 @@ module mc64_video #(
     localparam [8:0] SLOT_END_W = 9'(V_PIC + SLOT_LINES);
     assign blank_slot = (vc >= V_PIC_W) && (vc < SLOT_END_W);
 
+    /* ---- THE FRAME STORE: the picture is a COMPLETED frame ----------------
+     *
+     * (2026-10-21, the panel's `Dead End Holiday Demo`: the `FIND PRESENTS`
+     * banner's last two rows showed the room's background instead of the bar.)
+     *
+     * The picture used to be a live read of the framebuffer -- one port-B byte
+     * per pixel, taken as the beam reached it. That is only right if the
+     * cartridge has finished writing by the time the beam arrives, and the beam
+     * arrives over the last 27,307 clocks of the CPU's 106,666-clock frame
+     * (rows are 426.67 clocks apart). A cartridge that redraws on vblank is
+     * usually done long before that, which is what the phase lock above bought;
+     * one that is still drawing -- and this one was, it reaches the banner about
+     * 9,400 clocks after the picture starts -- was caught mid-redraw, and the
+     * rows the beam passed before the cartridge got to them came out as what was
+     * there before: the room. The emulator cannot do that: exec6502() runs a
+     * whole frame and display_machine() then renders a snapshot, so it only ever
+     * shows a COMPLETED frame.
+     *
+     * This makes the hardware do the same thing, in the only way a raster that is
+     * always sweeping can: it CAPTURES the framebuffer into a 4 KB store during
+     * the blanking and draws the picture from the store. 4,096 reads at one per
+     * clock, in the fifty blank lines before the palette reload (vc 188..237) --
+     * after the previous frame's redraw and before the machine draws this one,
+     * and outside the picture's own lines so the copy can never disturb the
+     * scan-out. What the panel shows is therefore always a frame that was
+     * finished in the RAM when it was captured.
+     *
+     * AND IT IS NOT A FRAME LATE FOR MOST CARTRIDGES. The capture runs at clocks
+     * ~52,900..72,800 of the CPU's 106,666-clock frame and the picture is drawn
+     * at 79,359..106,666 of THE SAME FRAME (the phase lock above puts the picture
+     * at the frame's end), so what the panel shows is the current frame's
+     * framebuffer as of the capture -- the emulator's own frame N, not N-1. The
+     * sample point is the only thing that moved: a cartridge that has finished
+     * drawing by ~72,800 shows exactly what display_machine() shows for that
+     * frame, which is what sim/ compares and finds at offset 0.
+     *
+     * It is a frame late for a cartridge still drawing after the capture -- this
+     * one redraws its banner at ~88,800 -- and nothing can avoid that: from the
+     * moment the beam is over the picture there is no later moment in the frame
+     * at which a finished version of what it is scanning can exist. The only
+     * alternative is buffering a whole frame and painting after the boundary,
+     * which is what the emulator does and would be a frame late for EVERY
+     * cartridge, not just the late ones.
+     *
+     * WHY THOSE 50 LINES AND NOT MORE. The capture has to be as LATE as possible
+     * before the picture (the earlier it runs, the more of the frame it misses),
+     * and the reload owns port B from vc 238. 50 lines of 87..89 cycles is 4,350
+     * at worst -- 4,098 reads, plus one re-issue per DMC borrow.
+     *
+     * TWO STORES, because a capture may never be shown half-written: the beam
+     * reads one while the copy fills the other, and they are swapped only when
+     * all 4,096 bytes have landed. A capture that runs out of window, or that a
+     * state transfer or a held machine interrupts, does not swap at all -- the
+     * panel keeps the frame it had, which is exactly what a held picture should
+     * be.
+     *
+     * THE BANK: the capture reads the bank latched for the frame it is capturing
+     * (`vram_bank_q`). A cartridge that changes $0100, or its palette bank,
+     * between the capture and the reload gets one frame with the previous one --
+     * the same one-frame lag this costs everywhere else, not a new fault.
+     *
+     * THE FALLBACK: `cap_ok` is 0 until the first capture completes and the picture
+     * then reads port B exactly as it always did, so the first frame of a run (and
+     * any run too short to fill the store) is byte-identical to the old path.
+     */
+    localparam [8:0]  CP_FIRST_W = 9'd188;                     // first capture line
+    localparam [8:0]  CP_LAST_W  = 9'(V_TOTAL - LD_ROWS - 1);  // 237: the reload is 238..249
+    localparam [12:0] CP_N       = 13'd4096;
+
+    /* `ramstyle` the way mc64_ram and mc64_savestates do it: these are 4 KB
+     * arrays with one write port and one read port and they MUST be M10K blocks,
+     * not 32,768 flip-flops each. `no_rw_check` because the read and the write
+     * never land on the same array in the same cycle (the beam reads the front
+     * store while the copy fills the back one), so Quartus needs no bypass. */
+    (* ramstyle = "M10K, no_rw_check" *) logic [7:0] sh_a [0:4095];
+    (* ramstyle = "M10K, no_rw_check" *) logic [7:0] sh_b [0:4095];
+    logic [7:0] pic_q;           // the store's byte for the pixel being emitted
+
+    logic        cp_on;          // a capture is running
+    logic        cp_prev;        // a read was issued last cycle
+    logic        cp_prev_ok;     // ... into a cycle the DMC was not borrowing
+    logic [12:0] cp_idx;         // next index to issue
+    logic [12:0] cp_pidx;        // the index issued last cycle
+    logic        cap_ok;         // a complete frame is in the store
+    logic        cap_sel;        // 0: sh_a on screen, 1: sh_b
+
+    // The byte the pixel being emitted was drawn from: the store once it is
+    // full, port B before that (see THE FALLBACK).
+    wire [7:0]  pix_byte  = cap_ok ? pic_q : ram_rdata;
+    wire [15:0] cap_base  = {vram_bank_q[3:0], 12'b0};
+
+    // This cycle's copy read landed, and was not taken by the DMC.
+    wire cp_hold  = cp_on && (vc <= CP_LAST_W) && cp_prev && cp_prev_ok && !dmc_take;
+    // ... and if it did not land, the index has to be issued again.
+    wire cp_retry = cp_on && (vc <= CP_LAST_W) && cp_prev && !cp_hold;
+
     /* ---- the DEFAULT palette, as a FUNCTION of the pixel byte -------------
      *
      * Bank 0 is not "the bytes at 0": it is the emulator's generated default
@@ -646,6 +768,14 @@ module mc64_video #(
     wire [15:0] bank_base = {vram_bank_q[3:0], 12'b0};
     wire [15:0] pix_addr  = bank_base + {4'b0, pix_index};
 
+    /* The byte the picture is drawn FROM, for the harness (see the port note):
+     * the store's once it is full, port B's before that. It is the same register
+     * the colour lookup consumes, so a picture record holds exactly the byte
+     * that produced each pixel on the wire. The address of that pixel is the
+     * port-B address, which mc64_top still drives from `pix_addr` during the
+     * picture -- and which is the address the store was filled from. */
+    assign pic_byte = pix_byte;
+
     /* THE RELOAD'S FIRST CYCLE IS NOT A FETCH.
      *
      * It is the cycle `pl` is cleared AND the bank pair is latched, and both of
@@ -703,6 +833,9 @@ module mc64_video #(
             locked <= 1'b0;  sync_en_q <= 1'b0;  sync_en_r <= 1'b0;
             vs_done <= 1'b0;  err_px <= '0;  adj <= ADJ_NONE;  adj_q <= ADJ_NONE;
             pic_hold <= 1'b0;  rel_done <= 1'b0;
+            cp_on <= 1'b0;  cp_prev <= 1'b0;  cp_prev_ok <= 1'b0;
+            cp_idx <= 13'd0;  cp_pidx <= 13'd0;
+            cap_ok <= 1'b0;  cap_sel <= 1'b0;
         end
         else if (ce) begin
             frame_end <= 1'b0;
@@ -854,6 +987,68 @@ module mc64_video #(
             else
                 hc <= hc + 9'd1;
 
+            /* ---- THE CAPTURE (see THE FRAME STORE above) -------------------
+             *
+             * Started on the first cycle of CP_FIRST's line and run to the last
+             * cycle of CP_LAST's, one read per clock: present an index, retire
+             * the previous one's data a cycle later. The store is filled only
+             * while this runs, and the buffers are swapped only by the cycle
+             * that retires index 4,095 -- so a capture that is cut short (out of
+             * window, a transfer, a held machine) leaves the panel's frame
+             * alone. */
+            if (hc == 9'd0 && vc == CP_FIRST_W && !load_blank && !bank_hold) begin
+                cp_on      <= 1'b1;
+                cp_idx     <= 13'd0;
+                cp_prev    <= 1'b0;
+                cp_prev_ok <= 1'b0;
+            end
+
+            if (cp_on && (vc <= CP_LAST_W)) begin
+                if (cp_retry) begin
+                    /* The DMC took port B on the cycle this read was to land in:
+                     * the byte on the bus is its sample, not the framebuffer, so
+                     * the index is issued again rather than captured wrong. */
+                    cp_idx  <= cp_pidx;
+                    cp_prev <= 1'b0;
+                end
+                else begin
+                    if (cp_prev && (cp_pidx == (CP_N - 13'd1))) begin
+                        cp_on <= 1'b0;
+                        /* ... and only hand it to the panel if nothing was
+                         * writing the framebuffer while it was captured. */
+                        if (!load_blank && !bank_hold) begin
+                            cap_sel <= ~cap_sel;
+                            cap_ok  <= 1'b1;
+                        end
+                    end
+                    /* issue this cycle's read (the address itself is driven by
+                     * the port mux below, from the same index) */
+                    if (cp_idx < CP_N) begin
+                        cp_pidx    <= cp_idx;
+                        cp_prev_ok <= !dmc_take;
+                        cp_prev    <= 1'b1;
+                        cp_idx     <= cp_idx + 13'd1;
+                    end
+                end
+            end
+            else if (cp_on) begin
+                /* The window closed before the store was full: keep the frame
+                 * the panel already has, and try again next frame. */
+                cp_on   <= 1'b0;
+                cp_prev <= 1'b0;
+            end
+
+            /* the byte the last issue delivered, into the buffer NOT on screen */
+            if (cp_hold) begin
+                if (cap_sel) sh_a[cp_pidx[11:0]] <= ram_rdata;
+                else         sh_b[cp_pidx[11:0]] <= ram_rdata;
+            end
+
+            /* ... and the byte for the pixel this cycle's colour will emit: the
+             * store's, read with the same index and the same one-clock latency
+             * as the port-B read it replaces, so nothing downstream moves. */
+            pic_q <= cap_sel ? sh_b[pix_index] : sh_a[pix_index];
+
             /* ---- the bank pair, read once per frame as the emulator does ----
              *
              * display_machine() reads $0100/$0101 once and renders the whole
@@ -907,6 +1102,10 @@ module mc64_video #(
                 ram_addr <= {pal_bank_q, 8'b0} + {8'b0, pl};
                 pl       <= pl + 10'd1;
             end
+            else if (cp_on && (vc <= CP_LAST_W) && (cp_idx < CP_N) && !cp_retry)
+                /* the capture's read; it owns port B for its window, and it
+                 * never overlaps the reload above or the picture below */
+                ram_addr <= cap_base + {3'b0, cp_idx};
             else if (in_pic)
                 ram_addr <= pix_addr;
             else
@@ -953,9 +1152,12 @@ module mc64_video #(
             if (de_d && !pic_hold)
                 /* the RAW byte is the index; bank 0 is the generated default,
                  * any other bank is the 768 bytes the reload packed into `pal`
-                 * -- both already RGB565, both left-aligned onto the wire here */
-                video_rgb <= palbase0 ? rgb565_to_wire(default_rgb565(ram_rdata))
-                                      : rgb565_to_wire(pal[ram_rdata]);
+                 * -- both already RGB565, both left-aligned onto the wire here.
+                 * `pix_byte` is the STORE's byte once it is full (see THE FRAME
+                 * STORE) and port B's before that, so the colour always comes
+                 * from the byte tb_mc64 records for that pixel. */
+                video_rgb <= palbase0 ? rgb565_to_wire(default_rgb565(pix_byte))
+                                      : rgb565_to_wire(pal[pix_byte]);
             else
                 video_rgb <= 24'h0;   /* zero whenever DE is low -- the rule,
                                        * and the load's held picture with it */
