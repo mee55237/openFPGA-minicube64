@@ -12,7 +12,8 @@ https://github.com/aeriform-io/minicube64
 
 Note that Arlet 6502 does not support common illegal instructions.
 
-ROMS/carts: Unlike the official minicube64, this cannot bundle the Loopy Assembler. This repo does have pre-assembled roms for convenience, and if a rom is in .s then just run it in the official emulator to get the .bin. Default file extensions supported by data.json are .bin and .mc64; they go to (Drive letter aka D or E, NOT C drive):\Assets\minicube64\common. If you use linux, then it's different but still Assets/minicube64/common.   
+ROMS/carts: Unlike the official minicube64, this cannot bundle the Loopy Assembler. This repo does have pre-assembled roms for convenience, and if a rom is in .s then just run it in the official emulator to get the .bin. Default file extensions supported by data.json are .bin and .mc64; they go to 
+(Drive letter aka D or E, NOT C drive):\Assets\minicube64\common. If you use linux, then it's different but still Assets/minicube64/common.   
 
 AI use: Yes this is ai, but NOT a slop core, this uses mostly human modules (Arlet 6502 by Arlet Ottens and Anders and apu by Ludvig Strigeus). I wrote this myself. I hand tested all test roms, everything should work; if not submit issues or pull requests please.  For those curious, I used DeepSeek V4.1 Flash max reasoning in freebuff. 
 
