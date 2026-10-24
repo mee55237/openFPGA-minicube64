@@ -16,6 +16,17 @@ ROMS/carts: Unlike the official minicube64, this cannot bundle the Loopy Assembl
 
 AI use: Yes this is ai, but NOT a slop core, this uses mostly human modules (Arlet 6502 by Arlet Ottens and Anders and apu by Ludvig Strigeus). I wrote this myself. I hand tested all test roms, everything should work; if not submit issues or pull requests please.  For those curious, I used DeepSeek V4.1 Flash max reasoning in freebuff. 
 
+<p align="center">
+  <table align="center">
+    <tr>
+      <td><img src="screenshots/Plasma.png" width="256" style="image-rendering: pixelated;"></td>
+      <td><img src="screenshots/Sine.png" width="256" style="image-rendering: pixelated;"></td>
+      <td><img src="screenshots/Owl.png" width="256" style="image-rendering: pixelated;"></td>
+
+    </tr>
+  </table>
+</p>
+
 Credits: ΛERIF°RM and MonstersGoBoom for Minicube64 itself and docs. Arlet Ottens and Anders for the 6502 cpu. [Agg23](https://github.com/agg23/openfpga-NES), [Ludvig Strigeus](https://github.com/strigeus/fpganes), [@sorgelig](https://github.com/sorgelig), [@greyrogue](https://github.com/greyrogue), [@Kitrinx](https://github.com/Kitrinx), [@paulb-nl](https://github.com/paulb-nl), and many more.
 
 Licenses: I am not a lawyer, but some components of this used GPLv3 and that is why this is GPLv3
