@@ -22,7 +22,6 @@ AI use: Yes this is ai, but NOT a slop core, this uses mostly human modules (Arl
       <td><img src="screenshots/Plasma.png" width="256" style="image-rendering: pixelated;"></td>
       <td><img src="screenshots/Sine.png" width="256" style="image-rendering: pixelated;"></td>
       <td><img src="screenshots/Owl.png" width="256" style="image-rendering: pixelated;"></td>
-
     </tr>
   </table>
 </p>
