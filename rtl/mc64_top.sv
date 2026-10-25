@@ -173,6 +173,13 @@ module mc64_top (
      * those addresses between the VS and the frame's last cycle. */
     output logic [ 7:0] dbg_vram_bank_q,
     output logic [ 7:0] dbg_pal_bank_q,
+    /* The palette reload's own read window: the pixel cycle on which the video
+     * consumes a palette byte and its index into the 768. A harness needs both
+     * to say what the palette cache actually holds -- it is filled from one
+     * read port over ~8.7 lines, so sampling it at the frame boundary is not
+     * the same thing (see the port note in rtl/mc64_video.sv). */
+    output logic        dbg_ld_valid,
+    output logic [ 9:0] dbg_ld_idx,
     /* TEMPORARY (remove me): the machine's own hold latches and its frame
      * counter, so a harness can say WHICH of them is holding a frozen machine
      * and whether the counter that releases them is still rolling. */
@@ -527,6 +534,8 @@ module mc64_top (
     // window reads them); the harness keeps its own names for them
     assign dbg_vram_bank_q = video_cur_vram_bank;
     assign dbg_pal_bank_q  = video_cur_pal_bank;
+    assign dbg_ld_valid   = video_ld_valid;
+    assign dbg_ld_idx     = video_ld_idx;
     assign dbg_ss_freeze   = ss_freeze;
     assign dbg_pause_hold  = pause_hold;
     assign dbg_pause_freeze = pause_freeze;
@@ -725,6 +734,8 @@ module mc64_top (
     wire [ 7:0] ram_rdata_b;
     wire [15:0] vid_ram_addr;
     wire [ 7:0] video_pic_byte;
+    wire [15:0] video_cp_addr;
+    wire        video_cp_busy;
 
     // The DMC's sample fetch borrows one port-B cycle from the video. Both
     // signals are driven in the APU section below, where the fetch lives and
@@ -737,8 +748,13 @@ module mc64_top (
 
     // Port B: cartridge loader while reset is held, video scan-out otherwise,
     // and the DMC's byte in the single cycle the fetch asks for.
+    /* ... and the video's frame-store capture, which borrows the whole bus for
+     * four thousand clocks at the end of the frame, one byte each (see
+     * rtl/mc64_video.sv's THE CAPTURE). It sits BELOW `dmc_take` so a sample
+     * fetch is never lost; the video re-issues the read it lands on. */
     wire [15:0] ram_b_addr  = rom_we ? rom_addr
                             : dmc_take ? dmc_addr
+                            : video_cp_busy ? video_cp_addr
                             : vid_ram_addr;
     wire        ram_b_we    = rom_we;
     // Port B writes ONE BYTE, into one of mc64_ram's four byte-wide banks -- it
@@ -1062,6 +1078,8 @@ module mc64_top (
     // is -- both for the state engine's deferred window (see that module).
     logic [7:0] video_cur_vram_bank, video_cur_pal_bank;
     logic       video_blank_slot;
+    logic       video_ld_valid;
+    logic [9:0] video_ld_idx;
 
     mc64_video #(
         .FRAME_CLOCKS   (FRAME_CLOCKS)   // single source of truth: see above
@@ -1100,6 +1118,16 @@ module mc64_top (
          * note), so it needs to know. */
         .dmc_take       (dmc_take),
         .pic_byte       (video_pic_byte),
+        .cp_addr        (video_cp_addr),
+        .cp_busy        (video_cp_busy),
+        // the CPU's own store strobe: the frame store's write-through (THE SNOOP
+        // in mc64_video) applies every framebuffer store to the back buffer, so
+        // what the panel shows is the RAM at the boundary, not at 97,000 clocks.
+        // APU writes are excluded (they are not RAM bytes -- see the port-A gate
+        // above) and so is the state engine, which owns port A.
+        .cpu_we         (cpu_write && !apu_cs && !ss_ram_own),
+        .cpu_addr       (AB),
+        .cpu_wdata      (DO),
         .video_rgb      (video_rgb),
         .video_de       (video_de),
         .video_hs       (video_hs),
@@ -1107,7 +1135,9 @@ module mc64_top (
         .frame_end      (video_frame_end),  // the raster's own rollover; see below
         .cur_vram_bank  (video_cur_vram_bank),
         .cur_pal_bank   (video_cur_pal_bank),
-        .blank_slot     (video_blank_slot)
+        .blank_slot     (video_blank_slot),
+        .ld_valid_o     (video_ld_valid),
+        .ld_idx_o       (video_ld_idx)
     );
 
     assign dbg_frame_end = vblank_tick;

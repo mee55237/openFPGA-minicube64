@@ -55,9 +55,10 @@
  * exactly would mean a CPU budget that is not the emulator's, 106,666.67 not
  * being the emulator's number.
  *
- * WHAT MUST BE LOCKED IS WHERE THE PICTURE SITS INSIDE THE CPU'S FRAME, because
- * the picture is a live read of the framebuffer: one port-B read per pixel, the
- * byte used on the next pixel, no line store and no frame store. A cartridge
+ * WHAT IS LOCKED IS WHERE THE PICTURE SITS INSIDE THE CPU'S FRAME, AND THE
+ * HISTORY IS WHY. It used to be a correctness requirement: the picture was a
+ * live read of the framebuffer -- one port-B read per pixel, the byte used on
+ * the next pixel, no line store and no frame store -- and a cartridge
  * redraws its screen immediately after the vblank interrupt -- the start of the
  * CPU's frame -- so a raster that is also sweeping the screen at that moment
  * reads rows the cartridge has already erased and not yet rewritten. That is
@@ -76,14 +77,15 @@
  * module then runs exactly as it always did -- which is what keeps the bring-up
  * picture, and tools/video_sim.sh's free-running geometry, unchanged):
  *
- *   1. THE PICTURE MAY NOT START UNTIL THE CPU'S FRAME IS NEARLY OVER. The last
- *      PICTURE_CLK clocks of the CPU's frame are a window (mc64_top hands this
- *      module `frame_cnt`, so the window is just a comparison); the frame's last
- *      line is held, blank, until that window is open, and only then does the
- *      raster roll into the picture. The picture therefore always RUNS FROM the
- *      end of the CPU's frame TOWARDS its boundary, so what it reads is the
- *      frame the cartridge has just finished drawing -- the same thing
- *      display_machine() renders in the emulator, one frame later, exactly.
+ *   1. THE PICTURE IS ANCHORED TO THE CPU'S FRAME. It used to be anchored at the
+ *      frame's END (the picture waited for the last PICTURE_CLK clocks and then
+ *      ran towards the boundary), because the beam was reading the framebuffer
+ *      live and had to read it as late as the cartridge allowed. It is now
+ *      anchored at the frame's START -- PH_START = 0 -- because the store does
+ *      the sampling and the picture is only a display of it. `frame_cnt` is
+ *      still what it is compared against, so the two frames stay locked; only
+ *      the offset they are locked at changed, and with it the picture's latency
+ *      (see the PH_START note below).
  *
  *   2. WHAT IS LEFT OVER GOES INTO THE BLANKING, A PIXEL AT A TIME. The raster's
  *      own frame is 0.67 of a clock longer, and the wait above is quantised to
@@ -113,10 +115,12 @@
  * its `FIND PRESENTS` banner top-down and reaches it about 9,400 clocks after
  * the picture starts, so the beam read the last two rows of the bar before the
  * cartridge had written them and the picture showed the room instead. THE FRAME
- * STORE below is the answer -- the picture is drawn from a 4 KB copy taken in
- * the blanking, so it is always a frame the cartridge had FINISHED, at the cost
- * of at most one raster frame of latency -- zero for a cartridge that has
- * finished drawing before the capture. See that note for the whole of it.
+ * STORE below is the answer -- the picture is drawn from a 4 KB base copy taken
+ * in the frame's last lines and kept current, byte for byte, by every store the
+ * cartridge makes after it (THE SNOOP), so the store at the boundary is the RAM
+ * at the boundary, which is exactly the instant display_machine() takes its
+ * snapshot. It is scanned from the next frame's start, so the added latency is
+ * 1.1..5.4 ms rather than a frame. See that note for the whole of it.
  *
  * {frame_end} below is the raster's own rollover, kept for the testbench.
  *
@@ -347,6 +351,16 @@ module mc64_video #(
      * a framebuffer byte. */
     input  logic        dmc_take,
 
+    /* ---- the CPU's store port, for the frame store's write-through ---------
+     *
+     * Every store the cartridge makes is visible here on the cycle it is made
+     * (`mc64_top` passes its own `cpu_write`, `AB` and `DO`). THE SNOOP at the
+     * end of this file uses it to keep the captured frame current with the
+     * cartridge's last-minute writes; nothing else reads it. */
+    input  logic        cpu_we,
+    input  logic [15:0] cpu_addr,
+    input  logic [ 7:0] cpu_wdata,
+
     // ---- APF video ----
     output logic [23:0] video_rgb,
     output logic        video_de,
@@ -384,6 +398,28 @@ module mc64_video #(
      * byte is no longer the one on the RAM bus (see THE FRAME STORE below).
      * Nothing in the core reads them. */
     output logic [ 7:0] pic_byte,
+
+    /* ---- the palette reload's read window (observation only) --------------
+     *
+     * `ld_valid_o` is high on the pixel cycle a palette byte is being consumed
+     * and `ld_idx_o` is that byte's index into the 768. A harness can read the
+     * same machine-RAM byte at that same instant, which is the only way to say
+     * what the cache holds: it is filled from ONE READ PORT over ~8.7 lines, so
+     * a cartridge that rewrites the palette inside that window leaves a cache
+     * that is half one palette and half another, and a sample taken at any
+     * other instant (the frame boundary, say) is not what the picture used.
+     * tb_mc64 does exactly that; nothing in the core reads these two. */
+    output logic        ld_valid_o,
+    output logic [ 9:0] ld_idx_o,
+
+    /* ---- the capture's port-B request (see THE CAPTURE at the end) -------
+     *
+     * `cp_busy` asks mc64_top's port-B mux for the bus and `cp_addr` is the
+     * framebuffer byte to read -- one per machine clock, which is what lets the
+     * whole 4 KB burst fit in the last fourteen lines of the frame instead of needing
+     * 18.6% of it. Both are in the raw-clock domain on purpose. */
+    output logic [15:0] cp_addr,
+    output logic        cp_busy,
 
     /* ---- the raster's vertical blanking, as a slot a state write fits in ---
      *
@@ -423,13 +459,29 @@ module mc64_video #(
      * H_TOTAL pixels at 160/33 machine clocks per pixel, i.e.
      * 64 * 88 * 160/33 = 27,306.67, rounded to 27,307.
      *
-     * PH_START is where the picture must BEGIN for it to END on the CPU's frame
-     * boundary: FRAME_CLOCKS - PICTURE_CLK = 79,359. Everything the phase lock
-     * does is this one number. `frame_cnt >= PH_START` is the window in which
-     * the picture may run at all, and the difference between where the picture
-     * actually started and PH_START is the error the blanking then absorbs. */
+     * PH_START is where the picture BEGINS, and it is now the CPU's frame
+     * boundary itself (0). It used to be FRAME_CLOCKS - PICTURE_CLK = 79,359,
+     * i.e. the picture ENDED on the boundary, because the beam was reading the
+     * framebuffer live and had to read it as late as the cartridge would allow.
+     * With a frame store that constraint is gone, and the late position is
+     * nothing but latency: the picture would be drawn at the end of the frame
+     * while the store holds this frame's content, so a pixel would reach the
+     * panel ~80,000 clocks (0.75 frame) after it was captured. Put the picture
+     * at the frame's START instead -- it still follows the VS, which is what the
+     * APF rule asks -- and the same capture is scanned out from the next
+     * frame's first pixel: 1.1 ms at the top of the picture, 5.4 ms at the
+     * bottom, rather than 13..17 ms. Everything the phase lock does is this one
+     * number:
+     * `frame_cnt >= PH_START` is the window in which the picture may run at all,
+     * and the error between where it actually started and PH_START is what the
+     * blanking absorbs. */
     localparam int PICTURE_CLK = 27307;
-    localparam int PH_START    = FRAME_CLOCKS - PICTURE_CLK;
+    /* 1, not 0: the picture begins on the first clock after the frame boundary.
+     * Zero would be the same picture and a comparison the tools fold to a
+     * constant (Verilator refuses it, correctly -- a window that is always open
+     * is not a window), so the anchor is stated as "the boundary, and the one
+     * clock it takes to get there". */
+    localparam [16:0] PH_START_W = 17'd1;
 
     /* The trim's budget: the blank lines that may lend the phase one pixel
      * each, one pixel per line. The frame's LAST line is not one of them -- the
@@ -475,6 +527,19 @@ module mc64_video #(
     // twelve invisible lines. 12*H_TOTAL = 1056 >= 768 = 256 triples.
     localparam int LD_ROWS = 12;
     localparam [9:0] LD_BYTES = 10'd768;
+    /* THE RELOAD RUNS AFTER THE CAPTURE, AND ITS LENGTH IS THE LIMIT ON HOW LATE
+     * A CARTRIDGE MAY STILL BE DRAWING. The order is: the frame store's copy
+     * (vc 224..~234), then this (vc 238..249), then the boundary. Both read the
+     * same machine RAM, so a cartridge that is still writing EITHER the
+     * framebuffer or the 768 palette bytes while those windows are open gets one
+     * frame with a mixture -- the palette is fetched one byte per pixel period, so
+     * a write in the middle of it leaves the cache half old and half new. That is
+     * inherent to a single read port and it is why the reload sits in the
+     * blanking where a vblank-driven cartridge has long finished: `DRAW`-at-vblank
+     * carts pass, and the one case that trips it is a cartridge that writes its
+     * palette from its MAINLINE this late in the frame (`panel_stress`'s init is
+     * the only one in sim/roms that does, for the one frame its 768-byte sweep is
+     * still in flight). */
     localparam [8:0] LD_FIRST_W = 9'(V_TOTAL - LD_ROWS);
 
     logic [8:0] hc, vc;           // position, 0..H_TOTAL-1 (every line) / 0..V_TOTAL-1
@@ -531,10 +596,9 @@ module mc64_video #(
      *               fetches nothing else. From the first blank line on, the
      *               4 KB window is read by nobody.
      *   V_PIC+158   the reload, which is what reads the PALETTE window, starts
-     *               at LD_FIRST_W = V_TOTAL - 12 = 238, and a flush is 608
-     *               words x 8 bytes = 4,864 clocks = 11.4 lines. 226 is the
-     *               last start that clears it; 222 (158 lines) leaves four
-     *               lines of margin on top.
+     *               at LD_FIRST_W = 214, and a flush is 608 words x 8 bytes =
+     *               4,864 clocks = 11.4 lines. 200 is the last start that clears
+     *               it; 212 (148 lines) leaves two lines of margin on top.
      *
      * 158 of the frame's 250 lines therefore mean a copy that lands anywhere in
      * the blanking flushes at once, instead of waiting out most of a frame. */
@@ -561,42 +625,61 @@ module mc64_video #(
      * shows a COMPLETED frame.
      *
      * This makes the hardware do the same thing, in the only way a raster that is
-     * always sweeping can: it CAPTURES the framebuffer into a 4 KB store during
-     * the blanking and draws the picture from the store. 4,096 reads at one per
-     * clock, in the fifty blank lines before the palette reload (vc 188..237) --
-     * after the previous frame's redraw and before the machine draws this one,
-     * and outside the picture's own lines so the copy can never disturb the
-     * scan-out. What the panel shows is therefore always a frame that was
-     * finished in the RAM when it was captured.
+     * always sweeping can: it CAPTURES the framebuffer into a 4 KB store at the
+     * frame boundary and draws the picture from the store. 4,096 reads at one per
+     * clock, started by the rollover itself. What the panel shows is therefore
+     * always the frame the cartridge had FINISHED.
      *
-     * AND IT IS NOT A FRAME LATE FOR MOST CARTRIDGES. The capture runs at clocks
-     * ~52,900..72,800 of the CPU's 106,666-clock frame and the picture is drawn
-     * at 79,359..106,666 of THE SAME FRAME (the phase lock above puts the picture
-     * at the frame's end), so what the panel shows is the current frame's
-     * framebuffer as of the capture -- the emulator's own frame N, not N-1. The
-     * sample point is the only thing that moved: a cartridge that has finished
-     * drawing by ~72,800 shows exactly what display_machine() shows for that
-     * frame, which is what sim/ compares and finds at offset 0.
+     * WHERE THE CAPTURE RUNS, AND WHY IT IS AT THE BOUNDARY.
      *
-     * It is a frame late for a cartridge still drawing after the capture -- this
-     * one redraws its banner at ~88,800 -- and nothing can avoid that: from the
-     * moment the beam is over the picture there is no later moment in the frame
-     * at which a finished version of what it is scanning can exist. The only
-     * alternative is buffering a whole frame and painting after the boundary,
-     * which is what the emulator does and would be a frame late for EVERY
-     * cartridge, not just the late ones.
+     * The first version of this took the copy in the middle of the blanking
+     * (clocks ~52,900..72,800), which is *inside* the redraw, and the panel
+     * showed a room with the player sprite erased and half-drawn. The second took
+     * it in the last ten lines before the palette reload (clocks ~97,300..101,400)
+     * -- and that is still too early for a cartridge that draws to the very end.
+     * `flame_accesstuner` does exactly that: its `no SIGNAL` text is blitted in
+     * the last ~6,000 clocks of the frame, so the text was complete in the RAM at
+     * the boundary and absent from the store, and the panel showed static with a
+     * blank dark rectangle where the text belongs. That is the same failure as
+     * the sprite, one frame later in the cartridge's own work, and no position
+     * before the boundary fixes it: the last write lands ~300 clocks before the
+     * rollover.
      *
-     * WHY THOSE 50 LINES AND NOT MORE. The capture has to be as LATE as possible
-     * before the picture (the earlier it runs, the more of the frame it misses),
-     * and the reload owns port B from vc 238. 50 lines of 87..89 cycles is 4,350
-     * at worst -- 4,098 reads, plus one re-issue per DMC borrow.
+     * So the burst is the base, at vc 224: 4,096 reads take 4,098 clocks (3.8% of
+     * the frame). Everything the cartridge writes after it -- including the last
+     * 6,000 clocks, which is where the `no SIGNAL` text lives -- is applied to the
+     * same store by THE SNOOP at the end of this file, one CPU store at a time,
+     * so the store at the boundary is the RAM at the boundary. The picture stays
+     * at the start of the frame; the last store it includes may be 300 clocks
+     * before the boundary, the first pixel 1.1 ms after the burst that began the
+     * image.
+     *
+     * The cost is one frame of state, exactly as `display_machine()` has it, plus
+     * 1.1..5.4 ms of storage: 7,000 clocks from the end of the burst to the top
+     * row, 34,307 to the bottom one. It is the smallest a non-atomic copy can
+     * be -- the last store it includes may be 300 clocks before the boundary --
+     * but a write
+     * that arrives 300 clocks before the snapshot simply cannot be in a copy that
+     * started before it and takes 4,098 clocks. That is what the snoop is for --
+     * and it is why the burst sits at vc 224 rather than at 228: the cartridge's
+     * stores during the burst each cost it a cycle, and it must still be done
+     * before the palette reload at vc 238 needs the same port.
+     *
+     * WHY 1 BYTE PER MACHINE CLOCK, AND NOT PER PIXEL. A pixel-rate copy would be
+     * 4,098 pixel periods = 19,900 machine clocks, 18.6% of the frame, which
+     * would push the picture 0.3 ms further down and would not fit at all in the
+     * blanking once the reload is counted. Port B is clocked by the raw clock and
+     * the picture is no longer reading it (it reads the store), so the copy runs
+     * at one byte per machine clock: 4,098 clocks, 3.8% of the frame. That is why
+     * this block is clocked by `clk` rather than by `ce`, and why it presents its
+     * address through cp_addr / cp_busy instead of the picture's ram_addr.
      *
      * TWO STORES, because a capture may never be shown half-written: the beam
-     * reads one while the copy fills the other, and they are swapped only when
-     * all 4,096 bytes have landed. A capture that runs out of window, or that a
-     * state transfer or a held machine interrupts, does not swap at all -- the
-     * panel keeps the frame it had, which is exactly what a held picture should
-     * be.
+     * reads one while the copy fills the other, and they are swapped as soon as
+     * all 4,096 bytes have landed -- before the picture's first line, since the
+     * copy is 4,098 clocks and the top blanking is 5,120. A capture that a state
+     * transfer or a held machine interrupts does not swap at all -- the panel
+     * keeps the frame it had, which is exactly what a held picture should be.
      *
      * THE BANK: the capture reads the bank latched for the frame it is capturing
      * (`vram_bank_q`). A cartridge that changes $0100, or its palette bank,
@@ -607,8 +690,11 @@ module mc64_video #(
      * then reads port B exactly as it always did, so the first frame of a run (and
      * any run too short to fill the store) is byte-identical to the old path.
      */
-    localparam [8:0]  CP_FIRST_W = 9'd188;                     // first capture line
-    localparam [8:0]  CP_LAST_W  = 9'(V_TOTAL - LD_ROWS - 1);  // 237: the reload is 238..249
+    localparam [8:0]  CP_START_W = 9'd224;  // first line of the burst: far enough
+                                            // ahead of the reload at vc 238 that
+                                            // the CPU's stores during the burst
+                                            // (each one costs the burst a cycle)
+                                            // cannot push it into the reload
     localparam [12:0] CP_N       = 13'd4096;
 
     /* `ramstyle` the way mc64_ram and mc64_savestates do it: these are 4 KB
@@ -620,23 +706,26 @@ module mc64_video #(
     (* ramstyle = "M10K, no_rw_check" *) logic [7:0] sh_b [0:4095];
     logic [7:0] pic_q;           // the store's byte for the pixel being emitted
 
-    logic        cp_on;          // a capture is running
+    logic        cp_run;         // a capture is running (raw-clock domain)
     logic        cp_prev;        // a read was issued last cycle
     logic        cp_prev_ok;     // ... into a cycle the DMC was not borrowing
     logic [12:0] cp_idx;         // next index to issue
     logic [12:0] cp_pidx;        // the index issued last cycle
+    logic        cp_fire;        // the pixel domain asking for a capture
+    logic        cp_done;        // a whole frame landed; swap at the rollover
     logic        cap_ok;         // a complete frame is in the store
     logic        cap_sel;        // 0: sh_a on screen, 1: sh_b
+    logic [ 3:0] cap_bank;       // the bank the back store is being filled from
+    logic        cap_live;       // the capture is on screen; apply stores TO IT
 
     // The byte the pixel being emitted was drawn from: the store once it is
     // full, port B before that (see THE FALLBACK).
     wire [7:0]  pix_byte  = cap_ok ? pic_q : ram_rdata;
-    wire [15:0] cap_base  = {vram_bank_q[3:0], 12'b0};
 
     // This cycle's copy read landed, and was not taken by the DMC.
-    wire cp_hold  = cp_on && (vc <= CP_LAST_W) && cp_prev && cp_prev_ok && !dmc_take;
+    wire cp_hold  = cp_run && cp_prev && cp_prev_ok && !dmc_take;
     // ... and if it did not land, the index has to be issued again.
-    wire cp_retry = cp_on && (vc <= CP_LAST_W) && cp_prev && !cp_hold;
+    wire cp_retry = cp_run && cp_prev && !cp_hold;
 
     /* ---- the DEFAULT palette, as a FUNCTION of the pixel byte -------------
      *
@@ -741,15 +830,16 @@ module mc64_video #(
     wire [8:0] h_sync_eff = (adj_q == ADJ_SHORT) ? (H_SYNC_W - 9'd1) :
                             (adj_q == ADJ_LONG)  ? (H_SYNC_W + 9'd1) : H_SYNC_W;
 
-    /* The window: the last PICTURE_CLK clocks of the CPU's frame, i.e. the time
-     * in which the picture must run for it to end on the frame boundary. */
-    wire window_open = (frame_cnt >= 17'(PH_START));
+    /* The window: the CPU's frame, from its first clock. The raster may only
+     * roll into a picture inside it, which is what keeps the picture's lines
+     * where the CPU frame is -- see PH_START. */
+    wire window_open = (frame_cnt >= PH_START_W);
 
     /* The signed distance from PH_START to where this picture actually began,
      * in clocks. Positive means the picture began LATE (the raster is behind
      * the CPU's frame) and the blanking must give pixels back. */
     logic signed [17:0] d_clk;
-    assign d_clk = $signed({1'b0, frame_cnt}) - $signed(18'(PH_START));
+    assign d_clk = $signed({1'b0, frame_cnt}) - $signed(18'(PH_START_W));
 
     // ---- picture area, current and one pixel earlier ----
     wire h_pic_d = (hcd < H_ACT_W);
@@ -833,9 +923,8 @@ module mc64_video #(
             locked <= 1'b0;  sync_en_q <= 1'b0;  sync_en_r <= 1'b0;
             vs_done <= 1'b0;  err_px <= '0;  adj <= ADJ_NONE;  adj_q <= ADJ_NONE;
             pic_hold <= 1'b0;  rel_done <= 1'b0;
-            cp_on <= 1'b0;  cp_prev <= 1'b0;  cp_prev_ok <= 1'b0;
-            cp_idx <= 13'd0;  cp_pidx <= 13'd0;
-            cap_ok <= 1'b0;  cap_sel <= 1'b0;
+            cp_fire <= 1'b0;
+            cap_bank <= 4'd0;
         end
         else if (ce) begin
             frame_end <= 1'b0;
@@ -850,12 +939,12 @@ module mc64_video #(
              * The raster is not the CPU's frame and cannot be (see the header):
              * 22,000 pixels is 106,666.67 machine clocks and the CPU's frame is
              * 106,666. What CAN be locked is its PHASE, and here is the whole
-             * mechanism: the picture must END on the CPU's frame boundary, so
-             *     1. it must not START before the last PICTURE_CLK clocks of
-             *        the CPU's frame have begun -- at the frame's end the raster
-             *        waits (whole blank lines, nothing else changes) for the
-             *        window to open, so the picture always runs from the end of
-             *        the CPU's frame towards its boundary; and
+             * mechanism: the picture must START on the CPU's frame boundary, so
+             *     1. it may not roll into a frame before that boundary has
+             *        passed -- at the frame's end the raster waits (whole blank
+             *        lines, nothing else changes) for the window to open, so the
+             *        picture always runs from the boundary into the frame it
+             *        belongs to; and
              *     2. whatever is left over -- the 0.67 of a clock by which the
              *        raster's own frame is longer, and the line-granular
              *        overshoot of that wait -- is absorbed by the BLANKING, one
@@ -987,62 +1076,18 @@ module mc64_video #(
             else
                 hc <= hc + 9'd1;
 
-            /* ---- THE CAPTURE (see THE FRAME STORE above) -------------------
-             *
-             * Started on the first cycle of CP_FIRST's line and run to the last
-             * cycle of CP_LAST's, one read per clock: present an index, retire
-             * the previous one's data a cycle later. The store is filled only
-             * while this runs, and the buffers are swapped only by the cycle
-             * that retires index 4,095 -- so a capture that is cut short (out of
-             * window, a transfer, a held machine) leaves the panel's frame
-             * alone. */
-            if (hc == 9'd0 && vc == CP_FIRST_W && !load_blank && !bank_hold) begin
-                cp_on      <= 1'b1;
-                cp_idx     <= 13'd0;
-                cp_prev    <= 1'b0;
-                cp_prev_ok <= 1'b0;
+            /* ---- the frame store's capture, requested (THE FRAME STORE) -----
+             * The burst takes the bulk of the frame from the RAM at the start of
+             * the last ten blank lines; THE SNOOP at the end of this file then
+             * keeps it current with every framebuffer store until the boundary,
+             * which is what makes the store hold the boundary image and not the
+             * image as of 97,000 clocks. */
+            if (hc == 9'd0 && vc == CP_START_W && !load_blank && !bank_hold) begin
+                cp_fire  <= 1'b1;
+                cap_bank <= vram_bank_q[3:0];
             end
-
-            if (cp_on && (vc <= CP_LAST_W)) begin
-                if (cp_retry) begin
-                    /* The DMC took port B on the cycle this read was to land in:
-                     * the byte on the bus is its sample, not the framebuffer, so
-                     * the index is issued again rather than captured wrong. */
-                    cp_idx  <= cp_pidx;
-                    cp_prev <= 1'b0;
-                end
-                else begin
-                    if (cp_prev && (cp_pidx == (CP_N - 13'd1))) begin
-                        cp_on <= 1'b0;
-                        /* ... and only hand it to the panel if nothing was
-                         * writing the framebuffer while it was captured. */
-                        if (!load_blank && !bank_hold) begin
-                            cap_sel <= ~cap_sel;
-                            cap_ok  <= 1'b1;
-                        end
-                    end
-                    /* issue this cycle's read (the address itself is driven by
-                     * the port mux below, from the same index) */
-                    if (cp_idx < CP_N) begin
-                        cp_pidx    <= cp_idx;
-                        cp_prev_ok <= !dmc_take;
-                        cp_prev    <= 1'b1;
-                        cp_idx     <= cp_idx + 13'd1;
-                    end
-                end
-            end
-            else if (cp_on) begin
-                /* The window closed before the store was full: keep the frame
-                 * the panel already has, and try again next frame. */
-                cp_on   <= 1'b0;
-                cp_prev <= 1'b0;
-            end
-
-            /* the byte the last issue delivered, into the buffer NOT on screen */
-            if (cp_hold) begin
-                if (cap_sel) sh_a[cp_pidx[11:0]] <= ram_rdata;
-                else         sh_b[cp_pidx[11:0]] <= ram_rdata;
-            end
+            else if (cp_run)
+                cp_fire <= 1'b0;
 
             /* ... and the byte for the pixel this cycle's colour will emit: the
              * store's, read with the same index and the same one-clock latency
@@ -1102,14 +1147,16 @@ module mc64_video #(
                 ram_addr <= {pal_bank_q, 8'b0} + {8'b0, pl};
                 pl       <= pl + 10'd1;
             end
-            else if (cp_on && (vc <= CP_LAST_W) && (cp_idx < CP_N) && !cp_retry)
-                /* the capture's read; it owns port B for its window, and it
-                 * never overlaps the reload above or the picture below */
-                ram_addr <= cap_base + {3'b0, cp_idx};
             else if (in_pic)
                 ram_addr <= pix_addr;
             else
                 ram_addr <= 16'h0000;
+            /* The capture does NOT go through this register any more: it runs on
+             * the raw clock and asks for the bus through cp_addr/cp_busy, which
+             * mc64_top muxes in ahead of this. The picture's own port-B read is
+             * kept (it costs nothing and `dbg_vid_addr` is the harness's record
+             * of the address each pixel came from) even though the colour now
+             * comes from the store. */
 
             ld_valid_d <= ld_en;
             ld_idx_d   <= pl;
@@ -1163,5 +1210,173 @@ module mc64_video #(
                                        * and the load's held picture with it */
         end
     end
+
+    /* ------------------------------------------------------------------ *
+     * THE CAPTURE -- one byte per MACHINE clock, in the last fourteen lines.
+     * ------------------------------------------------------------------ *
+     *
+     * Deliberately NOT inside the `ce` block above: a pixel-rate copy is 4,098
+     * pixel periods (19,900 machine clocks, 18.6% of the frame) and a cartridge
+     * that draws until ~88,800 leaves no such span before the boundary. Port B is
+     * clocked by `clk`, so this reads a byte every clock instead: 4,098 clocks,
+     * 3.8% of the frame, which fits between the last thing a cartridge that
+     * finishes early writes and the palette reload at vc 238.
+     *
+     * It presents its address as cp_addr/cp_busy and mc64_top's port-B mux gives
+     * it the bus (after the DMC and the cartridge loader). A read that lands on a
+     * DMC borrow is RE-ISSUED rather than captured: the byte on the bus on that
+     * cycle is the sample fetch's, not the framebuffer's. The same re-issue
+     * covers a CPU store to a different index in the retire cycle, because the
+     * store has the store's one write port first.
+     *
+     * Writes go to the buffer that is NOT on screen, and the pair is swapped as
+     * soon as a whole capture lands -- long before the next picture -- so a burst
+     * that a state transfer or a held machine cuts short leaves the panel's
+     * picture alone. Stores after that swap go to the FRONT buffer until the
+     * boundary (THE SNOOP below), because they are still part of the image the
+     * next frame will scan. */
+    /* ---- THE SNOOP: THE BURST IS THE BASE, EVERY LATER STORE THE DELTA ----
+     *
+     * A 4 KB copy cannot be atomic, and `flame_accesstuner` is the proof that it
+     * has to be: it clears the screen ~140 clocks after the frame boundary and
+     * blits its `no SIGNAL` text in the last ~6,000 clocks before it, so the
+     * framebuffer is the COMPLETED image only for ~350 clocks, and both a copy
+     * that starts before that window and one that starts after it get the wrong
+     * picture. What the emulator compares against, though, is not a copy at all:
+     * display_machine() reads the RAM at the boundary, and every byte of the
+     * image got there through the CPU's own store port. So the hardware does not
+     * take a second snapshot -- it TRACKS the stores.
+     *
+     * The burst at CP_START_W is the base: the whole framebuffer as the RAM held
+     * it at 97,000 clocks. From then until the boundary every CPU store that
+     * lands in the same bank is written into the same store at the same index
+     * (`fb_we` below). The store at the boundary is therefore
+     *
+     *     RAM at 97,000  +  every store the cartridge made after 97,000
+     *   = RAM at the boundary,
+     *
+     * byte for byte, whatever the cartridge's own order was. A store that lands
+     * in the same cycle as the burst's retire wins the write port and the burst
+     * re-reads that byte next cycle; a store that lands one cycle before it
+     * (while the port-B read is in flight) suppresses the burst's write
+     * altogether, because the byte on `ram_rdata` is the one the store replaced.
+     * The first case is `cp_conflict`, the second `cp_suppress`.
+     *
+     * The bank is latched at the burst's start (`cap_bank`), not read live: at
+     * vc 238 the $0100 latch moves to the NEXT frame's bank, and those stores
+     * belong to a different 4 KB and must not land in this image.
+     */
+    logic [11:0] snoop_idx_q;    // the CPU's store last cycle...
+    logic        snoop_q;        // ...and whether there was one
+    logic [16:0] frame_cnt_d;
+
+    /* The CPU frame's first clock. `cap_live` is set when a capture is handed to
+     * the panel (the swap) and cleared here: between those two the completed
+     * image is the FRONT store, and the cartridge's stores still belong to it.
+     * After the boundary they belong to the next frame and go to the back. */
+    wire cpu_frame_start = (frame_cnt == 17'd0) && (frame_cnt_d != 17'd0);
+
+    wire        fb_we   = cpu_we && !load_blank && (cpu_addr[15:12] == cap_bank);
+    wire [11:0] fb_idx  = cpu_addr[11:0];
+    wire        to_front = fb_we && cap_live;
+
+    wire cp_suppress = cp_hold && snoop_q && (snoop_idx_q == cp_pidx[11:0]);
+    wire cp_conflict = cp_hold && fb_we && (fb_idx != cp_pidx[11:0]);
+    wire cp_retire   = cp_hold && !cp_conflict;
+    wire cp_write    = cp_retire && !cp_suppress;
+
+    /* ONE write statement per store, one write port: the CPU's store wins the
+     * cycle, the burst's byte takes it when the CPU has nothing to write. */
+    wire        st_we   = fb_we || cp_write;
+    wire [11:0] st_idx  = fb_we ? fb_idx : cp_pidx[11:0];
+    wire [ 7:0] st_data = fb_we ? cpu_wdata : ram_rdata;
+    /* The front is sh_b when cap_sel, sh_a otherwise; the back is the other. A
+     * capture store goes to the back, a late store to the front. */
+    wire        st_to_a = cap_sel ^ to_front;
+
+    always_ff @(posedge clk) begin
+        if (reset) begin
+            cp_run      <= 1'b0;
+            cp_prev     <= 1'b0;
+            cp_prev_ok  <= 1'b0;
+            cp_idx      <= 13'd0;
+            cp_pidx     <= 13'd0;
+            cp_done     <= 1'b0;
+            cap_ok      <= 1'b0;
+            cap_sel     <= 1'b0;
+            cap_live    <= 1'b0;
+            snoop_q     <= 1'b0;
+            snoop_idx_q <= 12'd0;
+            frame_cnt_d <= 17'd0;
+        end
+        else begin
+            frame_cnt_d <= frame_cnt;
+            if (cpu_frame_start) cap_live <= 1'b0;
+
+            snoop_q     <= fb_we;
+            if (fb_we) snoop_idx_q <= fb_idx;
+
+            if (st_we) begin
+                if (st_to_a) sh_a[st_idx] <= st_data;
+                else         sh_b[st_idx] <= st_data;
+            end
+
+            /* the pixel domain asked for a capture, on CP_START's first pixel */
+            if (cp_fire && !cp_run) begin
+                cp_run  <= 1'b1;
+                cp_idx  <= 13'd0;
+                cp_prev <= 1'b0;
+            end
+
+            if (cp_run) begin
+                /* retire the read issued last cycle */
+                if (cp_retire) begin
+                    if (cp_pidx == (CP_N - 13'd1)) begin
+                        cp_run  <= 1'b0;
+                        cp_prev <= 1'b0;
+                        /* ... and only hand it to the panel if nothing was
+                         * rewriting the framebuffer while it was read. */
+                        if (!load_blank && !bank_hold)
+                            cp_done <= 1'b1;
+                    end
+                end
+                else if (cp_retry || cp_conflict) begin
+                    /* the DMC took port B, or the CPU took the write port for a
+                     * different index: issue this index again */
+                    cp_idx  <= cp_pidx;
+                    cp_prev <= 1'b0;
+                end
+
+                /* issue this cycle's read. The address goes out COMBINATIONALLY
+                 * from cp_idx -- it is on the port for the whole cycle, and the
+                 * RAM's registered read answers it in the next one, which is the
+                 * cycle that retires it (cp_pidx). */
+                if (!cp_retry && !cp_conflict && (cp_idx < CP_N) &&
+                    (cp_run || cp_fire)) begin
+                    cp_pidx    <= cp_idx;
+                    cp_prev_ok <= !dmc_take;
+                    cp_prev    <= 1'b1;
+                    cp_idx     <= cp_idx + 13'd1;
+                end
+            end
+
+            /* A finished capture goes straight to the panel: the picture for
+             * this frame has long since been scanned (the burst is at vc 224,
+             * the picture at vc 0..63), so there is no half-captured frame on
+             * screen, and the next picture begins at the rollover. */
+            if (cp_done) begin
+                cap_sel  <= ~cap_sel;
+                cap_ok   <= 1'b1;
+                cap_live <= 1'b1;
+                cp_done  <= 1'b0;
+            end
+        end
+    end
+
+    assign cp_busy  = cp_run;
+    assign cp_addr  = {cap_bank, cp_idx[11:0]};
+    // the palette reload's consumption taps (see their port note)
+    assign ld_valid_o = ld_valid_d;
+    assign ld_idx_o   = ld_idx_d;
 
 endmodule
